@@ -4,16 +4,20 @@ import android.util.Log
 import java.io.*
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
 import java.net.URLDecoder
+import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
-class LocalStreamServer(private val port: Int = 8828) {
+class LocalStreamServer(preferredPort: Int = 8828) {
 
     private val isRunning = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
+    var activePort: Int = preferredPort
+        private set
     private val executor: ExecutorService = Executors.newCachedThreadPool()
 
     fun start() {
@@ -21,15 +25,23 @@ class LocalStreamServer(private val port: Int = 8828) {
 
         executor.execute {
             try {
-                serverSocket = ServerSocket(port)
-                Log.d(TAG, "StreamServer started on 127.0.0.1:$port")
+                // Try preferred port first; fallback to ephemeral port 0 if in use
+                serverSocket = try {
+                    ServerSocket(activePort)
+                } catch (e: IOException) {
+                    Log.w(TAG, "Preferred port $activePort busy, picking open port: ${e.message}")
+                    ServerSocket(0)
+                }
+                activePort = serverSocket!!.localPort
+                Log.d(TAG, "StreamServer started on 127.0.0.1:$activePort")
+
                 while (isRunning.get()) {
                     val socket = serverSocket?.accept() ?: break
                     executor.execute { handleClient(socket) }
                 }
             } catch (e: Exception) {
                 if (isRunning.get()) {
-                    Log.e(TAG, "Server socket error", e)
+                    Log.e(TAG, "StreamServer error: ${e.message}")
                 }
             }
         }
@@ -44,13 +56,14 @@ class LocalStreamServer(private val port: Int = 8828) {
     }
 
     fun getStreamUrl(filePath: String): String {
-        val encoded = java.net.URLEncoder.encode(filePath, "UTF-8")
-        return "http://127.0.0.1:$port/stream?file=$encoded"
+        val encoded = URLEncoder.encode(filePath, "UTF-8")
+        return "http://127.0.0.1:$activePort/stream?file=$encoded"
     }
 
     private fun handleClient(socket: Socket) {
         try {
             socket.use { s ->
+                s.soTimeout = 10000 // 10s socket read timeout
                 val reader = BufferedReader(InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8))
                 val firstLine = reader.readLine() ?: return
                 val parts = firstLine.split(" ")
@@ -80,15 +93,24 @@ class LocalStreamServer(private val port: Int = 8828) {
                 val filePath = URLDecoder.decode(rawFilePath, "UTF-8")
                 val file = File(filePath)
 
-                if (!file.exists()) {
-                    sendError(s.getOutputStream(), 404, "File Not Found")
+                // Wait up to 3 seconds for file creation if torrent just started allocating
+                var waitCount = 0
+                while (!file.exists() && waitCount < 15 && isRunning.get()) {
+                    Thread.sleep(200)
+                    waitCount++
+                }
+
+                if (!file.exists() || !file.canRead()) {
+                    sendError(s.getOutputStream(), 404, "File Not Available")
                     return
                 }
 
                 serveFile(s.getOutputStream(), file, rangeHeader)
             }
+        } catch (_: SocketException) {
+            // Client closed connection during scrub or pause, expected behavior
         } catch (e: Exception) {
-            Log.d(TAG, "Client connection ended: ${e.message}")
+            Log.d(TAG, "Client stream finished: ${e.message}")
         }
     }
 
@@ -114,47 +136,53 @@ class LocalStreamServer(private val port: Int = 8828) {
             }
         }
 
-        if (start > end || start >= fileLength) {
+        if (fileLength > 0 && (start > end || start >= fileLength)) {
             val header = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$fileLength\r\n\r\n"
             out.write(header.toByteArray(StandardCharsets.UTF_8))
             out.flush()
             return
         }
 
-        val contentLength = end - start + 1
+        val contentLength = if (fileLength > 0) (end - start + 1) else 0
         val isPartial = rangeHeader != null
 
         val responseHeader = StringBuilder()
         if (isPartial) {
             responseHeader.append("HTTP/1.1 206 Partial Content\r\n")
-            responseHeader.append("Content-Range: bytes $start-$end/$fileLength\r\n")
+            if (fileLength > 0) {
+                responseHeader.append("Content-Range: bytes $start-$end/$fileLength\r\n")
+            }
         } else {
             responseHeader.append("HTTP/1.1 200 OK\r\n")
         }
 
         responseHeader.append("Content-Type: $mimeType\r\n")
-        responseHeader.append("Content-Length: $contentLength\r\n")
+        if (contentLength > 0) {
+            responseHeader.append("Content-Length: $contentLength\r\n")
+        }
         responseHeader.append("Accept-Ranges: bytes\r\n")
+        responseHeader.append("Access-Control-Allow-Origin: *\r\n")
         responseHeader.append("Connection: keep-alive\r\n")
         responseHeader.append("\r\n")
 
         out.write(responseHeader.toString().toByteArray(StandardCharsets.UTF_8))
         out.flush()
 
-        // Stream file content
+        if (fileLength == 0L) return
+
         RandomAccessFile(file, "r").use { raf ->
             raf.seek(start)
-            val buffer = ByteArray(64 * 1024) // 64KB buffer
+            val buffer = ByteArray(64 * 1024)
             var remaining = contentLength
 
             while (remaining > 0 && isRunning.get()) {
                 val toRead = minOf(buffer.size.toLong(), remaining).toInt()
                 val read = raf.read(buffer, 0, toRead)
                 if (read == -1) {
-                    // Torrent might still be writing; wait briefly up to 1 second
-                    Thread.sleep(100)
-                    val newLength = file.length()
-                    if (newLength <= raf.filePointer) {
+                    // Torrent might still be downloading; pause briefly waiting for new bytes
+                    Thread.sleep(150)
+                    val updatedLen = file.length()
+                    if (updatedLen <= raf.filePointer) {
                         break
                     }
                     continue
@@ -182,6 +210,7 @@ class LocalStreamServer(private val port: Int = 8828) {
             "mov" -> "video/quicktime"
             "mp3" -> "audio/mpeg"
             "flac" -> "audio/flac"
+            "ogg" -> "audio/ogg"
             else -> "application/octet-stream"
         }
     }

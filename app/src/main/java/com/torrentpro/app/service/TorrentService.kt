@@ -132,12 +132,16 @@ class TorrentService : Service() {
             .build()
 
         if (!isForeground) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+                isForeground = true
+            } catch (e: Exception) {
+                android.util.Log.w("TorrentService", "startForeground failed: ${e.message}")
             }
-            isForeground = true
         } else {
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
             manager.notify(NOTIFICATION_ID, notification)

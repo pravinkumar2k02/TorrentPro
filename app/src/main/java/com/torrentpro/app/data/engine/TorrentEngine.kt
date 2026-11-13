@@ -26,12 +26,16 @@ import org.libtorrent4j.alerts.TorrentFinishedAlert
 import org.libtorrent4j.swig.session_handle
 import org.libtorrent4j.swig.torrent_flags_t
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 class TorrentEngine(private val context: Context) {
 
     private val sessionManager = SessionManager()
     val streamServer = LocalStreamServer(8828)
+    private val backgroundExecutor = Executors.newSingleThreadExecutor()
 
     private val _torrents = MutableStateFlow<List<TorrentItem>>(emptyList())
     val torrents: StateFlow<List<TorrentItem>> = _torrents.asStateFlow()
@@ -43,7 +47,7 @@ class TorrentEngine(private val context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var appSettings = AppSettings(
-        downloadDirectory = File(context.getExternalFilesDir(null), "Downloads").absolutePath
+        downloadDirectory = StorageHelper.getDefaultDownloadDir()
     )
 
     private val loopRunnable = object : Runnable {
@@ -66,13 +70,14 @@ class TorrentEngine(private val context: Context) {
         val params = SessionParams()
         val settings = params.settings
 
-        // Thermal and battery optimizations for mobile (prevent phone overheating)
+        // Apply connection and thermal optimization settings
         settings.connectionsLimit(appSettings.maxConnections)
         settings.activeDownloads(4)
         settings.activeSeeds(if (appSettings.stopSeedingOnComplete) 0 else 2)
-        settings.activeLimit(6)
-        settings.setEnableDht(true)
-        settings.setEnableLsd(true)
+        settings.activeLimit(8)
+        settings.setEnableDht(appSettings.enableDht)
+        settings.setEnableLsd(appSettings.enableLsd)
+        settings.listenInterfaces("0.0.0.0:${appSettings.listenPort}")
 
         if (appSettings.maxDownloadSpeedKbps > 0) {
             settings.downloadRateLimit(appSettings.maxDownloadSpeedKbps * 1024)
@@ -81,9 +86,7 @@ class TorrentEngine(private val context: Context) {
             settings.uploadRateLimit(appSettings.maxUploadSpeedKbps * 1024)
         }
 
-        settings.setDhtBootstrapNodes(
-            "router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,dht.aelitis.com:6881"
-        )
+        settings.setDhtBootstrapNodes(appSettings.dhtBootstrapNodes)
 
         sessionManager.addListener(object : AlertListener {
             override fun types(): IntArray? = null
@@ -112,13 +115,21 @@ class TorrentEngine(private val context: Context) {
         sessionManager.start(params)
         streamServer.start()
         mainHandler.post(loopRunnable)
-        Log.i(TAG, "TorrentEngine and StreamServer started successfully")
+        Log.i(TAG, "TorrentEngine started on port ${appSettings.listenPort}")
     }
 
     fun stop() {
         mainHandler.removeCallbacks(loopRunnable)
         streamServer.stop()
         if (sessionManager.isRunning) {
+            // Save resume data and flush cache before shutting down
+            for (infoHash in torrentItemMap.keys.toList()) {
+                safeFindHandle(infoHash)?.let { handle ->
+                    try {
+                        handle.saveResumeData(TorrentHandle.FLUSH_DISK_CACHE)
+                    } catch (_: Exception) {}
+                }
+            }
             sessionManager.stop()
         }
         Log.i(TAG, "TorrentEngine stopped")
@@ -128,6 +139,7 @@ class TorrentEngine(private val context: Context) {
         if (!sessionManager.isRunning) return
         val pack = SettingsPack()
         pack.connectionsLimit(appSettings.maxConnections)
+        pack.listenInterfaces("0.0.0.0:${appSettings.listenPort}")
         if (appSettings.maxDownloadSpeedKbps > 0) {
             pack.downloadRateLimit(appSettings.maxDownloadSpeedKbps * 1024)
         } else {
@@ -137,11 +149,16 @@ class TorrentEngine(private val context: Context) {
             pack.uploadRateLimit(appSettings.maxUploadSpeedKbps * 1024)
         }
         pack.activeSeeds(if (appSettings.stopSeedingOnComplete) 0 else 2)
+        pack.setEnableDht(appSettings.enableDht)
+        pack.setEnableLsd(appSettings.enableLsd)
+        pack.setDhtBootstrapNodes(appSettings.dhtBootstrapNodes)
         sessionManager.applySettings(pack)
     }
 
-    fun downloadMagnet(magnetUri: String, saveDir: File = File(appSettings.downloadDirectory)): String? {
+    fun downloadMagnet(magnetUri: String, destinationPath: String? = null): String? {
         if (!sessionManager.isRunning) start()
+        val dest = destinationPath ?: appSettings.downloadDirectory
+        val saveDir = File(dest)
         if (!saveDir.exists()) saveDir.mkdirs()
 
         try {
@@ -149,11 +166,14 @@ class TorrentEngine(private val context: Context) {
             sessionManager.download(magnetUri, saveDir, flags)
 
             val infoHash = extractInfoHashFromMagnet(magnetUri) ?: java.util.UUID.randomUUID().toString().replace("-", "")
+            val displayDest = StorageHelper.getHumanReadablePath(context, dest)
+
             val item = TorrentItem(
                 id = infoHash,
                 infoHash = infoHash,
                 name = extractNameFromMagnet(magnetUri) ?: "Fetching metadata...",
-                savePath = saveDir.absolutePath,
+                savePath = dest,
+                displayDestination = displayDest,
                 stateString = "Fetching metadata",
                 isSequential = appSettings.enableSequentialVideo
             )
@@ -166,8 +186,10 @@ class TorrentEngine(private val context: Context) {
         }
     }
 
-    fun downloadTorrentFile(torrentFileBytes: ByteArray, saveDir: File = File(appSettings.downloadDirectory)): String? {
+    fun downloadTorrentFile(torrentFileBytes: ByteArray, destinationPath: String? = null): String? {
         if (!sessionManager.isRunning) start()
+        val dest = destinationPath ?: appSettings.downloadDirectory
+        val saveDir = File(dest)
         if (!saveDir.exists()) saveDir.mkdirs()
 
         try {
@@ -193,12 +215,15 @@ class TorrentEngine(private val context: Context) {
                 }
             }
 
+            val displayDest = StorageHelper.getHumanReadablePath(context, dest)
+
             val item = TorrentItem(
                 id = infoHash,
                 infoHash = infoHash,
                 name = ti.name(),
                 totalBytes = ti.totalSize(),
-                savePath = saveDir.absolutePath,
+                savePath = dest,
+                displayDestination = displayDest,
                 isVideo = isVideo,
                 videoFilePath = videoPath,
                 isSequential = true,
@@ -214,9 +239,14 @@ class TorrentEngine(private val context: Context) {
     }
 
     fun pauseTorrent(infoHash: String) {
-        val hash = Sha1Hash.parseHex(infoHash)
-        val handle = sessionManager.find(hash)
-        handle?.pause()
+        val handle = safeFindHandle(infoHash)
+        if (handle != null) {
+            handle.pause()
+            try {
+                // Flush disk cache to release active file locks for external file managers
+                handle.saveResumeData(TorrentHandle.FLUSH_DISK_CACHE)
+            } catch (_: Exception) {}
+        }
         torrentItemMap[infoHash]?.let {
             torrentItemMap[infoHash] = it.copy(isPaused = true, stateString = "Paused")
             syncLists()
@@ -224,19 +254,30 @@ class TorrentEngine(private val context: Context) {
     }
 
     fun resumeTorrent(infoHash: String) {
-        val hash = Sha1Hash.parseHex(infoHash)
-        val handle = sessionManager.find(hash)
+        val item = torrentItemMap[infoHash]
+        // Verify target directory still exists before resuming
+        if (item != null) {
+            val dir = File(item.savePath)
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+        }
+        val handle = safeFindHandle(infoHash)
         handle?.resume()
         torrentItemMap[infoHash]?.let {
-            torrentItemMap[infoHash] = it.copy(isPaused = false, stateString = "Downloading")
+            torrentItemMap[infoHash] = it.copy(isPaused = false, fileMissing = false, stateString = "Downloading")
             syncLists()
         }
     }
 
     fun pauseAll() {
-        for (infoHash in torrentItemMap.keys) {
-            val hash = Sha1Hash.parseHex(infoHash)
-            sessionManager.find(hash)?.pause()
+        for (infoHash in torrentItemMap.keys.toList()) {
+            safeFindHandle(infoHash)?.let { handle ->
+                handle.pause()
+                try {
+                    handle.saveResumeData(TorrentHandle.FLUSH_DISK_CACHE)
+                } catch (_: Exception) {}
+            }
         }
         for ((k, v) in torrentItemMap) {
             if (!v.isFinished) {
@@ -247,30 +288,28 @@ class TorrentEngine(private val context: Context) {
     }
 
     fun resumeAll() {
-        for (infoHash in torrentItemMap.keys) {
-            val hash = Sha1Hash.parseHex(infoHash)
-            sessionManager.find(hash)?.resume()
+        for (infoHash in torrentItemMap.keys.toList()) {
+            safeFindHandle(infoHash)?.resume()
         }
         for ((k, v) in torrentItemMap) {
             if (!v.isFinished) {
-                torrentItemMap[k] = v.copy(isPaused = false, stateString = "Downloading")
+                torrentItemMap[k] = v.copy(isPaused = false, fileMissing = false, stateString = "Downloading")
             }
         }
         syncLists()
     }
 
     fun removeTorrent(infoHash: String, deleteFiles: Boolean = false) {
-        try {
-            val hash = Sha1Hash.parseHex(infoHash)
-            val handle = sessionManager.find(hash)
-            if (handle != null) {
+        val handle = safeFindHandle(infoHash)
+        if (handle != null) {
+            try {
                 if (deleteFiles) {
                     sessionManager.remove(handle, session_handle.delete_files)
                 } else {
                     sessionManager.remove(handle)
                 }
-            }
-        } catch (_: Exception) {}
+            } catch (_: Exception) {}
+        }
 
         val item = torrentItemMap.remove(infoHash)
         if (deleteFiles && item != null) {
@@ -284,37 +323,35 @@ class TorrentEngine(private val context: Context) {
     }
 
     fun setSequentialDownload(infoHash: String, enable: Boolean) {
-        try {
-            val hash = Sha1Hash.parseHex(infoHash)
-            val handle = sessionManager.find(hash)
-            if (handle != null) {
+        val handle = safeFindHandle(infoHash)
+        if (handle != null) {
+            try {
                 if (enable) {
                     handle.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
                 } else {
                     handle.unsetFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
                 }
-            }
-            torrentItemMap[infoHash]?.let {
-                torrentItemMap[infoHash] = it.copy(isSequential = enable)
-                syncLists()
-            }
-        } catch (_: Exception) {}
+            } catch (_: Exception) {}
+        }
+        torrentItemMap[infoHash]?.let {
+            torrentItemMap[infoHash] = it.copy(isSequential = enable)
+            syncLists()
+        }
     }
 
     fun prioritizeForStreaming(infoHash: String) {
+        val handle = safeFindHandle(infoHash) ?: return
         try {
-            val hash = Sha1Hash.parseHex(infoHash)
-            val handle = sessionManager.find(hash) ?: return
             handle.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
 
             val ti = handle.torrentFile() ?: return
             val numPieces = ti.numPieces()
             if (numPieces > 0) {
-                val firstCount = minOf(10, numPieces)
+                val firstCount = minOf(15, numPieces)
                 for (i in 0 until firstCount) {
                     handle.piecePriority(i, Priority.TOP_PRIORITY)
                 }
-                val lastStart = maxOf(0, numPieces - 5)
+                val lastStart = maxOf(0, numPieces - 6)
                 for (i in lastStart until numPieces) {
                     handle.piecePriority(i, Priority.TOP_PRIORITY)
                 }
@@ -362,12 +399,12 @@ class TorrentEngine(private val context: Context) {
         val infoHash = handle.infoHash().toHex()
         Log.i(TAG, "Torrent finished: $infoHash")
 
-        // Immediately stop seeding as specifically requested:
-        // "once download complete the seeding should stop. and removed from the torrent list."
+        // Stop seeding immediately if configured
         if (appSettings.stopSeedingOnComplete) {
             handle.pause()
             try {
                 handle.setUploadLimit(0)
+                handle.saveResumeData(TorrentHandle.FLUSH_DISK_CACHE)
             } catch (_: Exception) {}
         }
 
@@ -385,7 +422,6 @@ class TorrentEngine(private val context: Context) {
                 completedTime = System.currentTimeMillis()
             )
 
-            // Auto-remove from active torrent list
             if (appSettings.autoRemoveOnComplete) {
                 torrentItemMap.remove(infoHash)
                 try {
@@ -395,7 +431,6 @@ class TorrentEngine(private val context: Context) {
                 torrentItemMap[infoHash] = finishedItem
             }
 
-            // Save to completed history
             val currentCompleted = _completedTorrents.value.toMutableList()
             if (currentCompleted.none { it.infoHash == infoHash }) {
                 currentCompleted.add(0, finishedItem)
@@ -411,10 +446,11 @@ class TorrentEngine(private val context: Context) {
         if (!sessionManager.isRunning) return
 
         var updated = false
+        // Snapshot keys to prevent ConcurrentModificationException
+        val keyList = torrentItemMap.keys.toList()
 
-        for (infoHash in torrentItemMap.keys) {
-            val hash = Sha1Hash.parseHex(infoHash)
-            val handle = sessionManager.find(hash) ?: continue
+        for (infoHash in keyList) {
+            val handle = safeFindHandle(infoHash) ?: continue
             if (!handle.isValid) continue
 
             val status = handle.status()
@@ -438,11 +474,24 @@ class TorrentEngine(private val context: Context) {
             val remainingBytes = maxOf(0L, totalBytes - doneBytes)
             val eta = if (dlSpeed > 0 && remainingBytes > 0) remainingBytes / dlSpeed else -1L
 
-            val stateStr = when (status.state()) {
-                TorrentStatus.State.CHECKING_FILES, TorrentStatus.State.CHECKING_RESUME_DATA -> "Checking files"
-                TorrentStatus.State.DOWNLOADING_METADATA -> "Fetching metadata"
-                TorrentStatus.State.DOWNLOADING -> if (existing.isPaused) "Paused" else "Downloading"
-                TorrentStatus.State.FINISHED, TorrentStatus.State.SEEDING -> {
+            // Check if file was moved or deleted externally while in progress
+            var fileMissing = false
+            if (existing.videoFilePath != null && doneBytes > 1024 * 1024) {
+                val f = File(existing.videoFilePath)
+                if (!f.exists()) {
+                    fileMissing = true
+                }
+            }
+
+            val stateStr = when {
+                fileMissing -> "Partial file removed externally"
+                existing.isPaused -> "Paused"
+                status.state() == TorrentStatus.State.CHECKING_FILES ||
+                        status.state() == TorrentStatus.State.CHECKING_RESUME_DATA -> "Checking files"
+                status.state() == TorrentStatus.State.DOWNLOADING_METADATA -> "Fetching metadata"
+                status.state() == TorrentStatus.State.DOWNLOADING -> "Downloading"
+                status.state() == TorrentStatus.State.FINISHED ||
+                        status.state() == TorrentStatus.State.SEEDING -> {
                     if (appSettings.stopSeedingOnComplete) "Completed" else "Seeding"
                 }
                 else -> "Active"
@@ -478,6 +527,7 @@ class TorrentEngine(private val context: Context) {
                 seeds = seeds,
                 etaSeconds = eta,
                 stateString = stateStr,
+                fileMissing = fileMissing,
                 isVideo = isVid,
                 videoFilePath = vPath
             )
@@ -493,13 +543,44 @@ class TorrentEngine(private val context: Context) {
         _torrents.value = torrentItemMap.values.toList().sortedByDescending { it.addedTime }
     }
 
+    fun testConnection(callback: (Boolean, String) -> Unit) {
+        backgroundExecutor.execute {
+            try {
+                // Parse first node from bootstrap nodes
+                val firstNode = appSettings.dhtBootstrapNodes.split(",").firstOrNull()?.trim() ?: "router.bittorrent.com:6881"
+                val host = firstNode.substringBefore(":")
+                val port = firstNode.substringAfter(":", "6881").toIntOrNull() ?: 6881
+
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(host, port), 4000)
+                }
+                mainHandler.post { callback(true, "Successfully connected to $host:$port") }
+            } catch (e: Exception) {
+                mainHandler.post { callback(false, "Connection check: ${e.localizedMessage ?: "Failed to reach bootstrap node"}") }
+            }
+        }
+    }
+
+    private fun safeFindHandle(infoHash: String): TorrentHandle? {
+        if (infoHash.length != 40 || !infoHash.all { it in "0123456789abcdefABCDEF" }) {
+            return null
+        }
+        return try {
+            val hash = Sha1Hash.parseHex(infoHash)
+            sessionManager.find(hash)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun extractInfoHashFromMagnet(magnet: String): String? {
         val prefix = "xt=urn:btih:"
         val idx = magnet.indexOf(prefix)
         if (idx == -1) return null
         val sub = magnet.substring(idx + prefix.length)
         val end = sub.indexOf('&')
-        return if (end != -1) sub.substring(0, end) else sub
+        val raw = if (end != -1) sub.substring(0, end) else sub
+        return if (raw.length == 40 && raw.all { it in "0123456789abcdefABCDEF" }) raw else null
     }
 
     private fun extractNameFromMagnet(magnet: String): String? {

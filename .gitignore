@@ -9,6 +9,6 @@
 .externalNativeBuild
 .cxx
 
-# Ensure APK is tracked as requested
-!*.apk
+# Ensure main APK is tracked as requested
+TorrentPro-release.apk
 !TorrentPro.apk

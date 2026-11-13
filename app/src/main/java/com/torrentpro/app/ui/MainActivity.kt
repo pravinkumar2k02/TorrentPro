@@ -19,12 +19,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -36,12 +39,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.torrentpro.app.data.engine.StorageHelper
 import com.torrentpro.app.data.model.AppSettings
 import com.torrentpro.app.data.model.TorrentItem
 import com.torrentpro.app.ui.player.VideoPlayerActivity
 import java.io.File
 
-// App Palette
+// App Theme Palette
 val DarkBg = Color(0xFF0F111A)
 val CardBg = Color(0xFF181B28)
 val CardBorder = Color(0xFF25293D)
@@ -54,6 +58,7 @@ val TextDim = Color(0xFF8E95AA)
 class MainActivity : ComponentActivity() {
 
     private val viewModel: TorrentViewModel by viewModels()
+    private var lastStreamLaunchTime = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -72,12 +77,17 @@ class MainActivity : ComponentActivity() {
                 MainScreen(
                     viewModel = viewModel,
                     onOpenVideoPlayer = { url, title, hash ->
-                        val pIntent = Intent(this, VideoPlayerActivity::class.java).apply {
-                            putExtra(VideoPlayerActivity.EXTRA_VIDEO_URL, url)
-                            putExtra(VideoPlayerActivity.EXTRA_VIDEO_TITLE, title)
-                            putExtra(VideoPlayerActivity.EXTRA_INFO_HASH, hash)
+                        val now = System.currentTimeMillis()
+                        // Debounce rapid clicks (within 1000ms) to prevent duplicate player activities
+                        if (now - lastStreamLaunchTime > 1000) {
+                            lastStreamLaunchTime = now
+                            val pIntent = Intent(this, VideoPlayerActivity::class.java).apply {
+                                putExtra(VideoPlayerActivity.EXTRA_VIDEO_URL, url)
+                                putExtra(VideoPlayerActivity.EXTRA_VIDEO_TITLE, title)
+                                putExtra(VideoPlayerActivity.EXTRA_INFO_HASH, hash)
+                            }
+                            startActivity(pIntent)
                         }
-                        startActivity(pIntent)
                     }
                 )
             }
@@ -125,6 +135,7 @@ fun MainScreen(
     viewModel: TorrentViewModel,
     onOpenVideoPlayer: (url: String, title: String, hash: String) -> Unit
 ) {
+    val context = LocalContext.current
     val torrents by viewModel.torrents.collectAsState()
     val completedTorrents by viewModel.completedTorrents.collectAsState()
     val settings by viewModel.settings.collectAsState()
@@ -132,9 +143,9 @@ fun MainScreen(
     val ulSpeed by viewModel.totalUploadSpeed.collectAsState()
     val activeCount by viewModel.activeCount.collectAsState()
 
-    var selectedTab by remember { mutableIntStateOf(0) }
-    var showAddDialog by remember { mutableStateOf(false) }
-    var showSettingsDialog by remember { mutableStateOf(false) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var showAddDialog by rememberSaveable { mutableStateOf(false) }
+    var showSettingsDialog by rememberSaveable { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -260,6 +271,9 @@ fun MainScreen(
                                         viewModel.getStreamUrl(item.videoFilePath)
                                     } else ""
                                     onOpenVideoPlayer(streamUrl, item.name, item.infoHash)
+                                },
+                                onRestart = {
+                                    viewModel.resumeTorrent(item.infoHash)
                                 }
                             )
                         }
@@ -296,12 +310,12 @@ fun MainScreen(
         AddTorrentDialog(
             defaultDir = settings.downloadDirectory,
             onDismiss = { showAddDialog = false },
-            onAddMagnet = { magnet, dir ->
-                viewModel.addMagnet(magnet, dir)
+            onAddMagnet = { magnet, customDir ->
+                viewModel.addMagnet(magnet, customDir)
                 showAddDialog = false
             },
-            onAddTorrentFile = { bytes, dir ->
-                viewModel.addTorrentFile(bytes, dir)
+            onAddTorrentFile = { bytes, customDir ->
+                viewModel.addTorrentFile(bytes, customDir)
                 showAddDialog = false
             }
         )
@@ -311,6 +325,7 @@ fun MainScreen(
         SettingsDialog(
             currentSettings = settings,
             onDismiss = { showSettingsDialog = false },
+            onTestConnection = { cb -> viewModel.testConnection(cb) },
             onSave = { updated ->
                 viewModel.updateSettings(updated)
                 showSettingsDialog = false
@@ -325,7 +340,8 @@ fun DownloadingTorrentCard(
     onPause: () -> Unit,
     onResume: () -> Unit,
     onRemove: (Boolean) -> Unit,
-    onPlayVideo: () -> Unit
+    onPlayVideo: () -> Unit,
+    onRestart: () -> Unit
 ) {
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
@@ -368,6 +384,17 @@ fun DownloadingTorrentCard(
                 }
             }
 
+            Spacer(modifier = Modifier.height(4.dp))
+
+            // Clearly visible destination folder
+            Text(
+                text = "📁 " + if (item.displayDestination.isNotBlank()) item.displayDestination else item.savePath,
+                color = TextDim,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+
             Spacer(modifier = Modifier.height(8.dp))
 
             // State & Percentage
@@ -378,6 +405,7 @@ fun DownloadingTorrentCard(
                 Text(
                     text = item.stateString,
                     color = when {
+                        item.fileMissing -> AccentRed
                         item.isPaused -> AccentYellow
                         item.stateString.contains("metadata") -> Color(0xFFB388FF)
                         else -> AccentCyan
@@ -450,8 +478,20 @@ fun DownloadingTorrentCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.End
             ) {
+                if (item.fileMissing) {
+                    Button(
+                        onClick = onRestart,
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentYellow, contentColor = Color.Black),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.height(34.dp)
+                    ) {
+                        Text("Restart Download", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+
                 // Play Video Stream Button (If video file is detected)
-                if (item.isVideo) {
+                if (item.isVideo && !item.fileMissing) {
                     Button(
                         onClick = onPlayVideo,
                         colors = ButtonDefaults.buttonColors(
@@ -474,25 +514,26 @@ fun DownloadingTorrentCard(
                 }
 
                 // Pause / Resume Button
-                OutlinedButton(
-                    onClick = if (item.isPaused) onResume else onPause,
-                    shape = RoundedCornerShape(8.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                    modifier = Modifier.height(34.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = if (item.isPaused) AccentGreen else Color.White
-                    )
-                ) {
-                    Icon(
-                        imageVector = if (item.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(if (item.isPaused) "Resume" else "Pause", fontSize = 12.sp)
+                if (!item.fileMissing) {
+                    OutlinedButton(
+                        onClick = if (item.isPaused) onResume else onPause,
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.height(34.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = if (item.isPaused) AccentGreen else Color.White
+                        )
+                    ) {
+                        Icon(
+                            imageVector = if (item.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(if (item.isPaused) "Resume" else "Pause", fontSize = 12.sp)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
                 }
-
-                Spacer(modifier = Modifier.width(8.dp))
 
                 // Delete Button
                 IconButton(
@@ -565,9 +606,9 @@ fun CompletedTorrentCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
-                    imageVector = Icons.Default.CheckCircle,
+                    imageVector = if (item.fileMissing) Icons.Default.Warning else Icons.Default.CheckCircle,
                     contentDescription = null,
-                    tint = AccentGreen,
+                    tint = if (item.fileMissing) AccentYellow else AccentGreen,
                     modifier = Modifier.size(20.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -582,19 +623,23 @@ fun CompletedTorrentCard(
                 )
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
 
+            // Clear visible destination
             Text(
-                text = "Size: ${item.formattedTotal} • Seeding Stopped",
+                text = "📁 " + if (item.displayDestination.isNotBlank()) item.displayDestination else item.savePath,
                 color = TextDim,
-                fontSize = 12.sp
-            )
-            Text(
-                text = "Saved in: ${item.savePath}",
-                color = TextDim.copy(alpha = 0.7f),
                 fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
+            )
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = if (item.fileMissing) "Status: File was moved or deleted externally" else "Size: ${item.formattedTotal} • Seeding Stopped",
+                color = if (item.fileMissing) AccentYellow else TextDim,
+                fontSize = 12.sp
             )
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -604,7 +649,7 @@ fun CompletedTorrentCard(
                 horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                if (item.isVideo) {
+                if (item.isVideo && !item.fileMissing) {
                     Button(
                         onClick = onPlayVideo,
                         colors = ButtonDefaults.buttonColors(
@@ -751,10 +796,10 @@ fun AddTorrentDialog(
     onAddTorrentFile: (ByteArray, String) -> Unit
 ) {
     val context = LocalContext.current
-    var magnetText by remember { mutableStateOf("") }
-    var chosenDir by remember { mutableStateOf(defaultDir) }
+    var magnetText by rememberSaveable { mutableStateOf("") }
+    // Per-download destination independent of global default
+    var chosenDir by rememberSaveable { mutableStateOf(defaultDir) }
 
-    // Launcher for selecting a .torrent file
     val torrentFileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -770,17 +815,12 @@ fun AddTorrentDialog(
         }
     }
 
-    // Launcher for selecting custom folder
     val folderLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
         if (uri != null) {
-            val path = uri.path ?: ""
-            chosenDir = if (path.contains(":")) {
-                "/storage/emulated/0/" + path.substringAfter(":")
-            } else {
-                uri.toString()
-            }
+            StorageHelper.persistTreeUri(context, uri)
+            chosenDir = uri.toString()
         }
     }
 
@@ -813,22 +853,22 @@ fun AddTorrentDialog(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                // Download folder selection
-                Text("Download Location:", fontSize = 12.sp, color = TextDim)
+                // Individual Destination selection
+                Text("Destination Folder for this file:", fontSize = 12.sp, color = TextDim)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = chosenDir,
+                        text = StorageHelper.getHumanReadablePath(context, chosenDir),
                         fontSize = 12.sp,
                         color = Color.White,
-                        maxLines = 1,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
                     TextButton(onClick = { folderLauncher.launch(null) }) {
-                        Text("Change", color = AccentCyan)
+                        Text("Choose Folder", color = AccentCyan)
                     }
                 }
 
@@ -859,7 +899,7 @@ fun AddTorrentDialog(
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = DarkBg)
             ) {
-                Text("Download")
+                Text("Start Download")
             }
         },
         dismissButton = {
@@ -874,44 +914,57 @@ fun AddTorrentDialog(
 fun SettingsDialog(
     currentSettings: AppSettings,
     onDismiss: () -> Unit,
+    onTestConnection: ((Boolean, String) -> Unit) -> Unit,
     onSave: (AppSettings) -> Unit
 ) {
-    var stopSeeding by remember { mutableStateOf(currentSettings.stopSeedingOnComplete) }
-    var autoRemove by remember { mutableStateOf(currentSettings.autoRemoveOnComplete) }
-    var sequentialVideo by remember { mutableStateOf(currentSettings.enableSequentialVideo) }
-    var maxConn by remember { mutableFloatStateOf(currentSettings.maxConnections.toFloat()) }
-    var onlyWifi by remember { mutableStateOf(currentSettings.onlyOnWifi) }
-    var downloadDir by remember { mutableStateOf(currentSettings.downloadDirectory) }
+    val context = LocalContext.current
+    var stopSeeding by rememberSaveable { mutableStateOf(currentSettings.stopSeedingOnComplete) }
+    var autoRemove by rememberSaveable { mutableStateOf(currentSettings.autoRemoveOnComplete) }
+    var sequentialVideo by rememberSaveable { mutableStateOf(currentSettings.enableSequentialVideo) }
+    var maxConn by rememberSaveable { mutableFloatStateOf(currentSettings.maxConnections.toFloat()) }
+    var maxConnPerTorrent by rememberSaveable { mutableFloatStateOf(currentSettings.maxConnectionsPerTorrent.toFloat()) }
+    var listenPort by rememberSaveable { mutableStateOf(currentSettings.listenPort.toString()) }
+    var maxDlSpeed by rememberSaveable { mutableStateOf(currentSettings.maxDownloadSpeedKbps.toString()) }
+    var maxUlSpeed by rememberSaveable { mutableStateOf(currentSettings.maxUploadSpeedKbps.toString()) }
+    var dhtNodes by rememberSaveable { mutableStateOf(currentSettings.dhtBootstrapNodes) }
+    var enableDht by rememberSaveable { mutableStateOf(currentSettings.enableDht) }
+    var enableLsd by rememberSaveable { mutableStateOf(currentSettings.enableLsd) }
+    var onlyWifi by rememberSaveable { mutableStateOf(currentSettings.onlyOnWifi) }
+    var downloadDir by rememberSaveable { mutableStateOf(currentSettings.downloadDirectory) }
+
+    // Test connection feedback
+    var testResultMsg by remember { mutableStateOf<String?>(null) }
+    var isTestingConnection by remember { mutableStateOf(false) }
 
     val folderLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
         if (uri != null) {
-            val path = uri.path ?: ""
-            downloadDir = if (path.contains(":")) {
-                "/storage/emulated/0/" + path.substringAfter(":")
-            } else {
-                uri.toString()
-            }
+            StorageHelper.persistTreeUri(context, uri)
+            downloadDir = uri.toString()
         }
     }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Settings", fontWeight = FontWeight.Bold) },
+        title = { Text("Settings & Connections", fontWeight = FontWeight.Bold) },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                // Download Location
-                Text("Download Directory:", fontSize = 12.sp, color = TextDim)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                // Section 1: Default Storage Location
+                Text("GLOBAL DEFAULT DOWNLOAD FOLDER", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = AccentCyan)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = downloadDir,
+                        text = StorageHelper.getHumanReadablePath(context, downloadDir),
                         fontSize = 12.sp,
                         color = Color.White,
-                        maxLines = 1,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
@@ -920,69 +973,160 @@ fun SettingsDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(10.dp))
                 HorizontalDivider(color = CardBorder)
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
-                // Stop Seeding When Finished
+                // Section 2: Download & Seeding Behaviors
+                Text("DOWNLOAD & SEEDING BEHAVIOR", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = AccentCyan)
+                Spacer(modifier = Modifier.height(6.dp))
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Stop Seeding When Done", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                        Text("Stops upload immediately to save data & battery", fontSize = 11.sp, color = TextDim)
+                        Text("Stop Seeding When Complete", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text("Cuts upload bandwidth to 0 to save battery & data", fontSize = 11.sp, color = TextDim)
                     }
                     Switch(checked = stopSeeding, onCheckedChange = { stopSeeding = it })
                 }
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Auto-Remove From List
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Auto-Remove on Finish", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                        Text("Removes finished torrent from active list", fontSize = 11.sp, color = TextDim)
+                        Text("Auto-Remove on Finish", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text("Moves finished torrent to Completed tab", fontSize = 11.sp, color = TextDim)
                     }
                     Switch(checked = autoRemove, onCheckedChange = { autoRemove = it })
                 }
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Sequential Video Download
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Stream Video While Downloading", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                        Text("Sequential piece priority for media playback", fontSize = 11.sp, color = TextDim)
+                        Text("Stream Video While Downloading", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text("Sequential piece priority for smooth playback", fontSize = 11.sp, color = TextDim)
                     }
                     Switch(checked = sequentialVideo, onCheckedChange = { sequentialVideo = it })
                 }
 
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = CardBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Section 3: Network & Thermal Connection Settings
+                Text("NETWORK & CONNECTION SETTINGS", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = AccentCyan)
+                Spacer(modifier = Modifier.height(6.dp))
+
+                OutlinedTextField(
+                    value = listenPort,
+                    onValueChange = { listenPort = it },
+                    label = { Text("Listen Port (1 - 65535)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Thermal Protection: Connection limit
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("Max Connections (Anti-Overheat):", fontSize = 12.sp, color = TextDim)
-                        Text("${maxConn.toInt()}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = AccentCyan)
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(
+                        value = maxDlSpeed,
+                        onValueChange = { maxDlSpeed = it },
+                        label = { Text("Max DL (KB/s, 0=unlimited)") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = maxUlSpeed,
+                        onValueChange = { maxUlSpeed = it },
+                        label = { Text("Max UL (KB/s)") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Thermal Protection: Connection limit slider
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Global Max Connections:", fontSize = 12.sp, color = TextDim)
+                    Text("${maxConn.toInt()}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = AccentCyan)
+                }
+                Slider(
+                    value = maxConn,
+                    onValueChange = { maxConn = it },
+                    valueRange = 10f..200f,
+                    steps = 18
+                )
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Max Connections Per Torrent:", fontSize = 12.sp, color = TextDim)
+                    Text("${maxConnPerTorrent.toInt()}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = AccentCyan)
+                }
+                Slider(
+                    value = maxConnPerTorrent,
+                    onValueChange = { maxConnPerTorrent = it },
+                    valueRange = 5f..100f,
+                    steps = 18
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                OutlinedTextField(
+                    value = dhtNodes,
+                    onValueChange = { dhtNodes = it },
+                    label = { Text("DHT Bootstrap Nodes") },
+                    modifier = Modifier.fillMaxWidth(),
+                    maxLines = 2
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Test Connection Button
+                OutlinedButton(
+                    onClick = {
+                        isTestingConnection = true
+                        testResultMsg = "Testing connection to bootstrap nodes..."
+                        onTestConnection { success, message ->
+                            isTestingConnection = false
+                            testResultMsg = message
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (isTestingConnection) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(8.dp))
                     }
-                    Slider(
-                        value = maxConn,
-                        onValueChange = { maxConn = it },
-                        valueRange = 20f..150f,
-                        steps = 12
+                    Text("Test Connection")
+                }
+
+                testResultMsg?.let { res ->
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = res,
+                        fontSize = 11.sp,
+                        color = if (res.contains("Successfully")) AccentGreen else AccentYellow
                     )
                 }
             }
@@ -990,16 +1134,26 @@ fun SettingsDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    onSave(
-                        currentSettings.copy(
-                            downloadDirectory = downloadDir,
-                            stopSeedingOnComplete = stopSeeding,
-                            autoRemoveOnComplete = autoRemove,
-                            enableSequentialVideo = sequentialVideo,
-                            maxConnections = maxConn.toInt(),
-                            onlyOnWifi = onlyWifi
-                        )
+                    val portNum = listenPort.toIntOrNull() ?: 6881
+                    val dlNum = maxDlSpeed.toIntOrNull() ?: 0
+                    val ulNum = maxUlSpeed.toIntOrNull() ?: 50
+
+                    val updated = currentSettings.copy(
+                        downloadDirectory = downloadDir,
+                        stopSeedingOnComplete = stopSeeding,
+                        autoRemoveOnComplete = autoRemove,
+                        enableSequentialVideo = sequentialVideo,
+                        listenPort = portNum.coerceIn(1, 65535),
+                        maxConnections = maxConn.toInt(),
+                        maxConnectionsPerTorrent = maxConnPerTorrent.toInt(),
+                        maxDownloadSpeedKbps = dlNum.coerceAtLeast(0),
+                        maxUploadSpeedKbps = ulNum.coerceAtLeast(0),
+                        dhtBootstrapNodes = dhtNodes,
+                        enableDht = enableDht,
+                        enableLsd = enableLsd,
+                        onlyOnWifi = onlyWifi
                     )
+                    onSave(updated)
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = DarkBg)
             ) {

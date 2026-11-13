@@ -3,6 +3,7 @@ package com.torrentpro.app.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.torrentpro.app.data.engine.StorageHelper
 import com.torrentpro.app.data.model.AppSettings
 import com.torrentpro.app.data.model.TorrentItem
 import com.torrentpro.app.data.repository.TorrentRepository
@@ -33,15 +34,15 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         list.count { !it.isPaused && !it.isFinished }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
-    fun addMagnet(magnetUri: String, customDir: String? = null) {
-        val saveDir = if (!customDir.isNullOrBlank()) File(customDir) else File(settings.value.downloadDirectory)
-        repository.engine.downloadMagnet(magnetUri, saveDir)
+    fun addMagnet(magnetUri: String, destinationPath: String? = null) {
+        val dest = destinationPath ?: settings.value.downloadDirectory
+        repository.engine.downloadMagnet(magnetUri, dest)
         TorrentService.start(getApplication())
     }
 
-    fun addTorrentFile(bytes: ByteArray, customDir: String? = null) {
-        val saveDir = if (!customDir.isNullOrBlank()) File(customDir) else File(settings.value.downloadDirectory)
-        repository.engine.downloadTorrentFile(bytes, saveDir)
+    fun addTorrentFile(bytes: ByteArray, destinationPath: String? = null) {
+        val dest = destinationPath ?: settings.value.downloadDirectory
+        repository.engine.downloadTorrentFile(bytes, dest)
         TorrentService.start(getApplication())
     }
 
@@ -79,11 +80,15 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         repository.updateSettings(newSettings)
     }
 
-    fun updateDownloadDirectory(path: String) {
-        repository.updateSettings(settings.value.copy(downloadDirectory = path))
+    fun testConnection(callback: (Boolean, String) -> Unit) {
+        repository.testConnection(callback)
     }
 
     fun getStreamUrl(filePath: String): String {
         return repository.engine.streamServer.getStreamUrl(filePath)
+    }
+
+    fun isFileAvailable(filePath: String?): Boolean {
+        return StorageHelper.checkFileExists(filePath)
     }
 }

@@ -18,7 +18,9 @@ data class TorrentItem(
     val isVideo: Boolean = false,
     val videoFilePath: String? = null,
     val savePath: String = "",
+    val displayDestination: String = "",
     val stateString: String = "Queued",
+    val fileMissing: Boolean = false,
     val addedTime: Long = System.currentTimeMillis(),
     val completedTime: Long? = null
 ) {
@@ -39,6 +41,7 @@ data class TorrentItem(
 
     val formattedEta: String
         get() = when {
+            fileMissing -> "Missing"
             isFinished -> "Completed"
             isPaused -> "Paused"
             etaSeconds < 0 -> "--:--:--"
@@ -53,7 +56,7 @@ data class TorrentItem(
 
     companion object {
         private val VIDEO_EXTENSIONS = setOf(
-            "mp4", "mkv", "avi", "mov", "webm", "flv", "ts", "wmv", "m4v", "3gp"
+            "mp4", "mkv", "avi", "mov", "webm", "flv", "ts", "wmv", "m4v", "3gp", "vob"
         )
 
         fun isVideoFile(fileName: String): Boolean {
