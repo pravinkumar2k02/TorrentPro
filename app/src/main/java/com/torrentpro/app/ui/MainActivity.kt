@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -35,6 +36,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -267,10 +269,16 @@ fun MainScreen(
                                     viewModel.removeTorrent(item.infoHash, deleteFiles)
                                 },
                                 onPlayVideo = {
-                                    val streamUrl = if (item.videoFilePath != null) {
-                                        viewModel.getStreamUrl(item.videoFilePath)
-                                    } else ""
-                                    onOpenVideoPlayer(streamUrl, item.name, item.infoHash)
+                                    val videoPath = item.videoFilePath ?: run {
+                                        val potentialFile = File(item.savePath, item.name)
+                                        if (potentialFile.exists()) potentialFile.absolutePath else null
+                                    }
+                                    if (videoPath == null) {
+                                        Toast.makeText(context, "Preparing video pieces... please wait a moment", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        val streamUrl = viewModel.getStreamUrl(videoPath)
+                                        onOpenVideoPlayer(streamUrl, item.name, item.infoHash)
+                                    }
                                 },
                                 onRestart = {
                                     viewModel.resumeTorrent(item.infoHash)
@@ -921,8 +929,8 @@ fun SettingsDialog(
     var stopSeeding by rememberSaveable { mutableStateOf(currentSettings.stopSeedingOnComplete) }
     var autoRemove by rememberSaveable { mutableStateOf(currentSettings.autoRemoveOnComplete) }
     var sequentialVideo by rememberSaveable { mutableStateOf(currentSettings.enableSequentialVideo) }
-    var maxConn by rememberSaveable { mutableFloatStateOf(currentSettings.maxConnections.toFloat()) }
-    var maxConnPerTorrent by rememberSaveable { mutableFloatStateOf(currentSettings.maxConnectionsPerTorrent.toFloat()) }
+    var maxConn by rememberSaveable { mutableStateOf(currentSettings.maxConnections.toString()) }
+    var maxConnPerTorrent by rememberSaveable { mutableStateOf(currentSettings.maxConnectionsPerTorrent.toString()) }
     var listenPort by rememberSaveable { mutableStateOf(currentSettings.listenPort.toString()) }
     var maxDlSpeed by rememberSaveable { mutableStateOf(currentSettings.maxDownloadSpeedKbps.toString()) }
     var maxUlSpeed by rememberSaveable { mutableStateOf(currentSettings.maxUploadSpeedKbps.toString()) }
@@ -1059,36 +1067,26 @@ fun SettingsDialog(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Thermal Protection: Connection limit slider
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text("Global Max Connections:", fontSize = 12.sp, color = TextDim)
-                    Text("${maxConn.toInt()}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = AccentCyan)
+                // Connection Limits (Custom text boxes)
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(
+                        value = maxConn,
+                        onValueChange = { maxConn = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("Global Max Conn") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = maxConnPerTorrent,
+                        onValueChange = { maxConnPerTorrent = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("Max Conn/Torrent") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
                 }
-                Slider(
-                    value = maxConn,
-                    onValueChange = { maxConn = it },
-                    valueRange = 10f..200f,
-                    steps = 18
-                )
-
-                Spacer(modifier = Modifier.height(4.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text("Max Connections Per Torrent:", fontSize = 12.sp, color = TextDim)
-                    Text("${maxConnPerTorrent.toInt()}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = AccentCyan)
-                }
-                Slider(
-                    value = maxConnPerTorrent,
-                    onValueChange = { maxConnPerTorrent = it },
-                    valueRange = 5f..100f,
-                    steps = 18
-                )
 
                 Spacer(modifier = Modifier.height(8.dp))
 
@@ -1137,6 +1135,8 @@ fun SettingsDialog(
                     val portNum = listenPort.toIntOrNull() ?: 6881
                     val dlNum = maxDlSpeed.toIntOrNull() ?: 0
                     val ulNum = maxUlSpeed.toIntOrNull() ?: 50
+                    val connNum = maxConn.toIntOrNull() ?: 60
+                    val connPerTorrentNum = maxConnPerTorrent.toIntOrNull() ?: 25
 
                     val updated = currentSettings.copy(
                         downloadDirectory = downloadDir,
@@ -1144,8 +1144,8 @@ fun SettingsDialog(
                         autoRemoveOnComplete = autoRemove,
                         enableSequentialVideo = sequentialVideo,
                         listenPort = portNum.coerceIn(1, 65535),
-                        maxConnections = maxConn.toInt(),
-                        maxConnectionsPerTorrent = maxConnPerTorrent.toInt(),
+                        maxConnections = connNum.coerceIn(1, 10000),
+                        maxConnectionsPerTorrent = connPerTorrentNum.coerceIn(1, 5000),
                         maxDownloadSpeedKbps = dlNum.coerceAtLeast(0),
                         maxUploadSpeedKbps = ulNum.coerceAtLeast(0),
                         dhtBootstrapNodes = dhtNodes,

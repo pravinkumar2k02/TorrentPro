@@ -69,6 +69,14 @@ class VideoPlayerActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         originalBrightness = window.attributes.screenBrightness
 
+        Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
+            android.util.Log.e("VideoPlayerActivity", "Uncaught video player error", throwable)
+            runOnUiThread {
+                Toast.makeText(applicationContext, "Video stream error: ${throwable.localizedMessage ?: "Playback failed"}", Toast.LENGTH_SHORT).show()
+                finish()
+            }
+        }
+
         val videoUrl = intent.getStringExtra(EXTRA_VIDEO_URL) ?: ""
         val videoTitle = intent.getStringExtra(EXTRA_VIDEO_TITLE) ?: "Video Player"
         val infoHash = intent.getStringExtra(EXTRA_INFO_HASH)
@@ -101,15 +109,24 @@ class VideoPlayerActivity : ComponentActivity() {
     }
 
     private fun registerNoisyAudioReceiver() {
-        noisyAudioReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
-                    exoPlayer?.pause()
+        try {
+            noisyAudioReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                        exoPlayer?.pause()
+                    }
                 }
             }
+            val filter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+            androidx.core.content.ContextCompat.registerReceiver(
+                this,
+                noisyAudioReceiver,
+                filter,
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        } catch (e: Exception) {
+            android.util.Log.w("VideoPlayerActivity", "Could not register noisy receiver: ${e.message}")
         }
-        val filter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
-        registerReceiver(noisyAudioReceiver, filter)
     }
 
     private fun adjustBrightness(delta: Float) {
@@ -227,7 +244,14 @@ class VideoPlayerActivity : ComponentActivity() {
                 .setSeekForwardIncrementMs(10000)
                 .setSeekBackIncrementMs(10000)
                 .build().apply {
-                    val mediaItem = MediaItem.fromUri(Uri.parse(videoUrl))
+                    val mediaUri = when {
+                        videoUrl.startsWith("http://", ignoreCase = true) ||
+                        videoUrl.startsWith("https://", ignoreCase = true) ||
+                        videoUrl.startsWith("content://", ignoreCase = true) ||
+                        videoUrl.startsWith("file://", ignoreCase = true) -> Uri.parse(videoUrl)
+                        else -> Uri.fromFile(File(videoUrl))
+                    }
+                    val mediaItem = MediaItem.fromUri(mediaUri)
                     setMediaItem(mediaItem)
                     if (lastSavedPositionMs > 0) {
                         seekTo(lastSavedPositionMs)
@@ -627,13 +651,15 @@ class VideoPlayerActivity : ComponentActivity() {
                                 fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                             )
 
+                            val safeDuration = maxOf(1f, totalDurationMs.toFloat())
+                            val safePosition = currentPositionMs.toFloat().coerceIn(0f, safeDuration)
                             Slider(
-                                value = if (totalDurationMs > 0) currentPositionMs.toFloat() else 0f,
+                                value = safePosition,
                                 onValueChange = { newPos ->
                                     currentPositionMs = newPos.toLong()
                                     player.seekTo(currentPositionMs)
                                 },
-                                valueRange = 0f..maxOf(1f, totalDurationMs.toFloat()),
+                                valueRange = 0f..safeDuration,
                                 modifier = Modifier
                                     .weight(1f)
                                     .padding(horizontal = 12.dp),

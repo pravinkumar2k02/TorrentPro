@@ -24,6 +24,16 @@ class TorrentRepository private constructor(private val context: Context) {
     init {
         engine.updateSettings(_settings.value)
         loadSavedCompletedTorrents()
+        loadSavedActiveTorrents()
+
+        engine.onTorrentFinishedListener = { finishedItem ->
+            saveCompletedTorrent(finishedItem)
+            removeActiveTorrent(finishedItem.infoHash)
+        }
+
+        engine.onActiveTorrentsChangedListener = { activeList ->
+            saveActiveTorrents(activeList)
+        }
     }
 
     private fun loadSettings(): AppSettings {
@@ -198,6 +208,71 @@ class TorrentRepository private constructor(private val context: Context) {
         } catch (_: Exception) {}
     }
 
+    fun saveActiveTorrents(list: List<TorrentItem>) {
+        try {
+            val array = JSONArray()
+            for (item in list) {
+                if (!item.isFinished) {
+                    val obj = JSONObject().apply {
+                        put("id", item.id)
+                        put("infoHash", item.infoHash)
+                        put("name", item.name)
+                        put("savePath", item.savePath)
+                        put("displayDestination", item.displayDestination)
+                        put("isSequential", item.isSequential)
+                        put("magnetUri", item.magnetUri ?: "")
+                        put("isVideo", item.isVideo)
+                        put("videoFilePath", item.videoFilePath ?: "")
+                    }
+                    array.put(obj)
+                }
+            }
+            prefs.edit().putString(KEY_ACTIVE_TORRENTS, array.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    fun removeActiveTorrent(infoHash: String) {
+        try {
+            val jsonArrayStr = prefs.getString(KEY_ACTIVE_TORRENTS, "[]") ?: "[]"
+            val array = JSONArray(jsonArrayStr)
+            val newArray = JSONArray()
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                if (obj.optString("infoHash") != infoHash) {
+                    newArray.put(obj)
+                }
+            }
+            prefs.edit().putString(KEY_ACTIVE_TORRENTS, newArray.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun loadSavedActiveTorrents() {
+        try {
+            val jsonArrayStr = prefs.getString(KEY_ACTIVE_TORRENTS, "[]") ?: "[]"
+            val array = JSONArray(jsonArrayStr)
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                val infoHash = obj.optString("infoHash")
+                val magnetUri = obj.optString("magnetUri")
+                val name = obj.optString("name", "Torrent")
+                val savePath = obj.optString("savePath")
+                val displayDestination = obj.optString("displayDestination")
+                val isSequential = obj.optBoolean("isSequential", true)
+
+                if (magnetUri.isNotBlank()) {
+                    engine.restoreActiveMagnet(
+                        infoHash = infoHash,
+                        magnetUri = magnetUri,
+                        name = name,
+                        savePath = savePath,
+                        displayDestination = displayDestination,
+                        isSequential = isSequential
+                    )
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
     companion object {
         private const val PREFS_NAME = "torrent_pro_prefs"
         private const val KEY_DOWNLOAD_DIR = "download_dir"
@@ -217,6 +292,7 @@ class TorrentRepository private constructor(private val context: Context) {
         private const val KEY_PROXY_HOST = "proxy_host"
         private const val KEY_PROXY_PORT = "proxy_port"
         private const val KEY_COMPLETED_LIST = "completed_list"
+        private const val KEY_ACTIVE_TORRENTS = "active_torrents"
 
         @Volatile
         private var INSTANCE: TorrentRepository? = null

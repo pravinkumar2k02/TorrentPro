@@ -22,7 +22,8 @@ data class TorrentItem(
     val stateString: String = "Queued",
     val fileMissing: Boolean = false,
     val addedTime: Long = System.currentTimeMillis(),
-    val completedTime: Long? = null
+    val completedTime: Long? = null,
+    val magnetUri: String? = null
 ) {
     val progressPercent: String
         get() = String.format("%.1f%%", progress * 100f)

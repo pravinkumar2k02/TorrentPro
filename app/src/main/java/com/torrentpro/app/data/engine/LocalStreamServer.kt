@@ -93,15 +93,15 @@ class LocalStreamServer(preferredPort: Int = 8828) {
                 val filePath = URLDecoder.decode(rawFilePath, "UTF-8")
                 val file = File(filePath)
 
-                // Wait up to 3 seconds for file creation if torrent just started allocating
+                // Wait up to 3 seconds for file creation and initial piece allocation
                 var waitCount = 0
-                while (!file.exists() && waitCount < 15 && isRunning.get()) {
+                while ((!file.exists() || file.length() == 0L) && waitCount < 15 && isRunning.get()) {
                     Thread.sleep(200)
                     waitCount++
                 }
 
-                if (!file.exists() || !file.canRead()) {
-                    sendError(s.getOutputStream(), 404, "File Not Available")
+                if (!file.exists() || !file.canRead() || file.length() == 0L) {
+                    sendError(s.getOutputStream(), 503, "Stream Buffering Pieces")
                     return
                 }
 
