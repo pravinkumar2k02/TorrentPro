@@ -226,11 +226,12 @@ class VideoPlayerActivity : ComponentActivity() {
         val player = remember {
             val loadControl = DefaultLoadControl.Builder()
                 .setBufferDurationsMs(
-                    1500,  // minBufferMs
-                    12000, // maxBufferMs
-                    1000,  // bufferForPlaybackMs
-                    2000   // bufferForPlaybackAfterRebufferMs
+                    25000, // minBufferMs (must be >= bufferForPlaybackAfterRebufferMs)
+                    50000, // maxBufferMs (must be >= minBufferMs)
+                    1500,  // bufferForPlaybackMs (low latency start)
+                    3000   // bufferForPlaybackAfterRebufferMs (fast rebuffer recovery)
                 )
+                .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
 
             val audioAttributes = AudioAttributes.Builder()
